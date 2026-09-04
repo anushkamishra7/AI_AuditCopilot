@@ -81,7 +81,15 @@ export function AppShell({
       </aside>
 
       <div className="min-w-0 flex-1">
-        <Topbar engagementId={engagementId} engagementName={engagementName} engagementSubtitle={engagementSubtitle} />
+        <Topbar
+          engagementId={engagementId}
+          engagementName={engagementName}
+          engagementSubtitle={engagementSubtitle}
+          userName={userName}
+          userInitials={userInitials}
+          userEmail={userEmail}
+          nav={nav}
+        />
         <PageTransition>{children}</PageTransition>
       </div>
     </div>

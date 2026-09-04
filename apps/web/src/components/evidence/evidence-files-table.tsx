@@ -3,7 +3,7 @@
 import { useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { ControlChip } from "@/components/badges";
+import { ControlChip } from "@/components/control-chip";
 import { SearchField } from "@/components/search-field";
 import { formatBytes, relativeTime } from "@/lib/format";
 import type { EvidenceFileRow } from "@/lib/api";
@@ -59,7 +59,7 @@ export function EvidenceFilesTable({ files, engagementId }: { files: EvidenceFil
                       {f.filename}
                     </td>
                     <td className="px-4 py-3.5 align-top">
-                      <ControlChip refCode={f.control_ref} />
+                      <ControlChip refCode={f.control_ref} engagementId={engagementId} />
                     </td>
                     <td className="max-w-xs truncate px-4 py-3.5 align-top text-[var(--ink-secondary)]">
                       <Link

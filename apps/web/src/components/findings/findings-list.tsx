@@ -1,5 +1,6 @@
 import Link from "next/link";
-import { ControlChip, severityStyle } from "@/components/badges";
+import { severityStyle } from "@/components/badges";
+import { ControlChip } from "@/components/control-chip";
 import { relativeTime } from "@/lib/format";
 import type { EvidenceRequest, Stakeholder } from "@/lib/types";
 
@@ -34,7 +35,7 @@ export function FindingsList({
           <section key={r.id} className="rounded-[var(--radius-card)] border border-[var(--border)] bg-[var(--surface)] p-5">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div className="flex min-w-0 items-center gap-2.5">
-                <ControlChip refCode={r.control_ref} />
+                <ControlChip refCode={r.control_ref} engagementId={engagementId} />
                 <Link href={href} className="truncate font-semibold text-[var(--ink)] hover:underline">
                   {r.title}
                 </Link>

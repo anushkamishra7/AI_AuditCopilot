@@ -1,7 +1,8 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { currentUser } from "@clerk/nextjs/server";
-import { ControlChip, StatusBadge } from "@/components/badges";
+import { StatusBadge } from "@/components/badges";
+import { ControlChip } from "@/components/control-chip";
 import { ReviewPanel } from "@/components/review/review-panel";
 import { dueLabel } from "@/lib/format";
 import { fetchEvidenceReview, fetchRequestDetail, fetchRequestActivity, mapWireAiReview } from "@/lib/api";
@@ -87,7 +88,7 @@ export default async function ReviewPage(
           <div className="mt-1.5 flex flex-wrap items-center justify-between gap-3">
             <div className="min-w-0">
               <div className="flex flex-wrap items-center gap-2">
-                <ControlChip refCode={request.control_ref} />
+                <ControlChip refCode={request.control_ref} engagementId={engagementId} />
                 <h1 className="text-lg leading-tight font-bold tracking-tight text-[var(--ink)]">{request.title}</h1>
                 <StatusBadge status={request.status} />
               </div>

@@ -3,7 +3,8 @@
 import { useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { CompletenessBadge, ControlChip, StatusBadge } from "@/components/badges";
+import { CompletenessBadge, StatusBadge } from "@/components/badges";
+import { ControlChip } from "@/components/control-chip";
 import { SearchField } from "@/components/search-field";
 import { SendRequestButton } from "@/components/requests/send-request-button";
 import { dueLabel, relativeTime } from "@/lib/format";
@@ -141,7 +142,7 @@ export function RequestsTable({
                     className="group cursor-pointer border-l-2 border-l-transparent transition-[transform,background-color,border-color] duration-[180ms] ease-[cubic-bezier(0.4,0,0.2,1)] hover:translate-x-[2px] hover:border-l-[var(--accent)] hover:bg-[var(--surface-raised)]"
                   >
                     <td className="px-4 py-3.5 align-top">
-                      <ControlChip refCode={r.control_ref} />
+                      <ControlChip refCode={r.control_ref} engagementId={engagementId} />
                     </td>
                     <td className="max-w-md px-4 py-3.5 align-top">
                       <Link
