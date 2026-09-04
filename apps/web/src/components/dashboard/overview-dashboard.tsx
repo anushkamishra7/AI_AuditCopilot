@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { ControlChip } from "@/components/badges";
+import { ControlChip } from "@/components/control-chip";
 import { dueLabel, relativeTime } from "@/lib/format";
 import { countRequests, isOverdue, isUrgent, aiReviewPct, controlReadinessPct, potentialExceptions } from "@/lib/request-status";
 import type { ActivityEvent } from "@/lib/api";

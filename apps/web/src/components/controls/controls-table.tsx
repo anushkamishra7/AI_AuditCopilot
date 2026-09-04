@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { ControlChip } from "@/components/badges";
+import { ControlChip } from "@/components/control-chip";
 import type { ControlGroup } from "@/lib/request-status";
 
 // There's no Controls entity/library in the database -- this table is built
@@ -34,7 +34,7 @@ export function ControlsTable({ groups, engagementId }: { groups: ControlGroup[]
           {groups.map((g) => (
             <tr key={g.control_ref} className="transition-colors hover:bg-[var(--surface-raised)]">
               <td className="px-4 py-3.5 align-top">
-                <ControlChip refCode={g.control_ref} />
+                <ControlChip refCode={g.control_ref} engagementId={engagementId} />
               </td>
               <td className="px-4 py-3.5 align-top">
                 <span

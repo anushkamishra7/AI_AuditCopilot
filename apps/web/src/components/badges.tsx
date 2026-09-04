@@ -82,13 +82,12 @@ export function confidenceStyle(confidence: ConfidenceLabel) {
   return CONFIDENCE_STYLE[confidence];
 }
 
-export function ControlChip({ refCode }: { refCode: string }) {
-  return (
-    <span className="rounded border border-[var(--border-strong)] bg-[var(--surface-raised)] px-1.5 py-0.5 font-mono text-[11px] font-medium text-[var(--ink-secondary)]">
-      {refCode}
-    </span>
-  );
-}
+// ControlChip moved to its own file (control-chip.tsx) -- its optional link
+// variant needs an onClick, which can't be passed as a prop from a Server
+// Component, so it has to be a Client Component. This file stays server-safe
+// on purpose: findings-list.tsx (a Server Component) calls severityStyle()
+// above directly, not just renders it, and that stops working the moment
+// this module is "use client".
 
 // No longer called anywhere -- the dashboard's Owner column now shows
 // name/role as text only, per the "no avatars" direction. Left defined
