@@ -28,7 +28,7 @@ from groq import Groq
 dotenv_path = Path(__file__).resolve().parents[1] / ".env"
 load_dotenv(dotenv_path, override=True)
 
-from app.review_text import prepare_review_text
+from app.review_text import apply_coverage_check, prepare_review_text, unreadable_review
 from app.upload_lookup import (
     RequestDetailResponse,
     UploadLookupResponse,
@@ -906,12 +906,29 @@ def upload_evidence_file(request_id: str, file: UploadFile = File(...)):
     full_text = extract_pdf_text(contents)
 
     prepared = prepare_review_text(full_text)
-    body, parsed = request_groq_review(prepared.doc_text)
 
-    # Code-based floor on completeness_label — runs regardless of what the
-    # model concluded. See apply_placeholder_check / find_unfilled_placeholders.
+    if prepared.has_text:
+        body, parsed = request_groq_review(prepared.doc_text)
+    else:
+        # Scanned / image-only PDF: nothing to send. Don't ask the model to
+        # review an empty document -- it returns a normal-looking review.
+        body = {
+            "provider": "none",
+            "model_requested": None,
+            "model_resolved": None,
+            "text": None,
+            "finish_reason": "skipped_no_text",
+        }
+        parsed = unreadable_review(prepared)
+
+    # Code-based floors on completeness_label — run regardless of what the
+    # model concluded. See apply_placeholder_check / apply_coverage_check.
     if parsed is not None:
         parsed = apply_placeholder_check(parsed, full_text)
+        parsed = apply_coverage_check(parsed, prepared)
+    body["chars_total"] = prepared.chars_total
+    body["chars_reviewed"] = prepared.chars_reviewed
+    body["truncated"] = prepared.truncated
 
     # persist ai_review row
     ai_id = f"ai_{uuid.uuid4().hex}"
@@ -939,7 +956,9 @@ def upload_evidence_file(request_id: str, file: UploadFile = File(...)):
             "UPDATE evidence_requests SET status = %s, last_activity_at = NOW() WHERE id = %s",
             ("pending_review", request_id),
         )
-        if parsed:
+        if not prepared.has_text:
+            log_activity(cur, request_id, "AI review", "ai", "AI analysis skipped", "No extractable text in PDF; the model was not called")
+        elif parsed:
             flags = len(parsed.get("missing_sections") or [])
             detail = f"Classified as {parsed.get('document_type', 'unknown document')} — completeness: {parsed.get('completeness_label', 'unknown')}"
             if flags:
