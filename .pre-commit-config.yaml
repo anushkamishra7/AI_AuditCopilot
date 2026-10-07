@@ -1,0 +1,12 @@
+repos:
+  - repo: https://github.com/sutradharhq/sutradhar
+    rev: v0.6.1
+    hooks:
+      - id: sutradhar-swallow
+        files: ^apps/api/.*\.py$
+      - id: sutradhar-interpolation
+        files: ^apps/api/.*\.py$
+        args: [--keywords, sql]
+      - id: sutradhar-conflated-degrade
+        args: [apps/api]
+      - id: sutradhar-ci-step
