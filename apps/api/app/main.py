@@ -28,6 +28,7 @@ from groq import Groq
 dotenv_path = Path(__file__).resolve().parents[1] / ".env"
 load_dotenv(dotenv_path, override=True)
 
+from app.review_text import prepare_review_text
 from app.upload_lookup import (
     RequestDetailResponse,
     UploadLookupResponse,
@@ -742,6 +743,78 @@ def log_activity(cur, request_id: str, actor: str, actor_type: str, action: str,
     )
 
 
+def extract_pdf_text(contents: bytes) -> str:
+    try:
+        reader = PdfReader(io.BytesIO(contents))
+        text_parts = []
+        for p in reader.pages:
+            page_text = p.extract_text() or ""
+            text_parts.append(page_text)
+        return "\n".join(text_parts)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail={"message": "Failed to extract PDF text", "error": str(exc)})
+
+
+def request_groq_review(doc_text: str) -> tuple[dict, dict | None]:
+    # Prepare the review prompt. No missing-key check here -- _check_required_env_vars()
+    # already guarantees GROQ_API_KEY is set for the lifetime of the process,
+    # or the app never started.
+    system_msg = (
+        "You are a compliance reviewer. Given the raw extracted text of a policy document, "
+        "return ONLY a JSON object with the following keys: document_type, summary, suggested_controls, missing_sections, completeness_label. "
+        "- document_type: short label like \"access control policy\"\n"
+        "- summary: 3-5 sentence summary\n"
+        "- suggested_controls: array of objects {control_name, confidence_label, rationale} where confidence_label is one of strong_match/partial_match/weak_match\n"
+        "- missing_sections: array of strings\n"
+        "- completeness_label: one of complete/partial/insufficient\n"
+        "Ensure the JSON parses cleanly; do not include any extra commentary."
+    )
+
+    prompt = f"Analyze the following document text:\n---\n{doc_text}\n---\nRespond as JSON per the schema."
+
+    # llama-3.3-70b-versatile (originally requested) isn't in this account's
+    # model catalog -- confirmed via client.models.list(), not assumed;
+    # Groq's lineup turns over. openai/gpt-oss-120b is the largest
+    # instruction-following chat model actually available, and JSON mode
+    # verified working against it directly before wiring it in here.
+    GROQ_MODEL = "openai/gpt-oss-120b"
+    try:
+        # Groq's chat-completions API is OpenAI-shaped (messages array,
+        # response_format for JSON mode) rather than Gemini's
+        # system_instruction/generation_config split -- same prompt, same
+        # schema, different envelope.
+        completion = groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.0,
+            max_tokens=4096,
+            response_format={"type": "json_object"},
+        )
+        assistant_text = completion.choices[0].message.content
+        # Same "raw_response JSONB" shape downstream expects (mapWireAiReview
+        # in apps/web/src/lib/api.ts reads model_resolved/model_requested off
+        # this) -- sourced from Groq now instead of Gemini.
+        body = {
+            "provider": "groq",
+            "model_requested": GROQ_MODEL,
+            "model_resolved": completion.model,
+            "text": assistant_text,
+            "finish_reason": completion.choices[0].finish_reason,
+        }
+        parsed = None
+        if assistant_text:
+            try:
+                parsed = json.loads(assistant_text)
+            except Exception:
+                parsed = None
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail={"message": "Groq API request failed", "error": str(exc)})
+    return body, parsed
+
+
 @app.post("/evidence-requests/{request_id}/upload")
 def upload_evidence_file(request_id: str, file: UploadFile = File(...)):
     # only accept PDFs for this first-pass implementation
@@ -830,76 +903,10 @@ def upload_evidence_file(request_id: str, file: UploadFile = File(...)):
 
     # extract text from the PDF -- straight from the in-memory bytes just
     # uploaded, no round trip back to disk or to Supabase needed.
-    try:
-        reader = PdfReader(io.BytesIO(contents))
-        text_parts = []
-        for p in reader.pages:
-            page_text = p.extract_text() or ""
-            text_parts.append(page_text)
-        full_text = "\n".join(text_parts)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail={"message": "Failed to extract PDF text", "error": str(exc)})
+    full_text = extract_pdf_text(contents)
 
-    # Prepare the review prompt. No missing-key check here -- _check_required_env_vars()
-    # already guarantees GROQ_API_KEY is set for the lifetime of the process,
-    # or the app never started.
-    system_msg = (
-        "You are a compliance reviewer. Given the raw extracted text of a policy document, "
-        "return ONLY a JSON object with the following keys: document_type, summary, suggested_controls, missing_sections, completeness_label. "
-        "- document_type: short label like \"access control policy\"\n"
-        "- summary: 3-5 sentence summary\n"
-        "- suggested_controls: array of objects {control_name, confidence_label, rationale} where confidence_label is one of strong_match/partial_match/weak_match\n"
-        "- missing_sections: array of strings\n"
-        "- completeness_label: one of complete/partial/insufficient\n"
-        "Ensure the JSON parses cleanly; do not include any extra commentary."
-    )
-
-    # Truncate input to a safe size
-    max_chars = 20000
-    doc_text = full_text[:max_chars]
-
-    prompt = f"Analyze the following document text:\n---\n{doc_text}\n---\nRespond as JSON per the schema."
-
-    # llama-3.3-70b-versatile (originally requested) isn't in this account's
-    # model catalog -- confirmed via client.models.list(), not assumed;
-    # Groq's lineup turns over. openai/gpt-oss-120b is the largest
-    # instruction-following chat model actually available, and JSON mode
-    # verified working against it directly before wiring it in here.
-    GROQ_MODEL = "openai/gpt-oss-120b"
-    try:
-        # Groq's chat-completions API is OpenAI-shaped (messages array,
-        # response_format for JSON mode) rather than Gemini's
-        # system_instruction/generation_config split -- same prompt, same
-        # schema, different envelope.
-        completion = groq_client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.0,
-            max_tokens=4096,
-            response_format={"type": "json_object"},
-        )
-        assistant_text = completion.choices[0].message.content
-        # Same "raw_response JSONB" shape downstream expects (mapWireAiReview
-        # in apps/web/src/lib/api.ts reads model_resolved/model_requested off
-        # this) -- sourced from Groq now instead of Gemini.
-        body = {
-            "provider": "groq",
-            "model_requested": GROQ_MODEL,
-            "model_resolved": completion.model,
-            "text": assistant_text,
-            "finish_reason": completion.choices[0].finish_reason,
-        }
-        parsed = None
-        if assistant_text:
-            try:
-                parsed = json.loads(assistant_text)
-            except Exception:
-                parsed = None
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail={"message": "Groq API request failed", "error": str(exc)})
+    prepared = prepare_review_text(full_text)
+    body, parsed = request_groq_review(prepared.doc_text)
 
     # Code-based floor on completeness_label — runs regardless of what the
     # model concluded. See apply_placeholder_check / find_unfilled_placeholders.
