@@ -154,3 +154,43 @@ def test_short_text_pdf_is_reviewed_normally(harness):
     assert review["suggested_controls"]
     assert stored_raw_response(harness.db)["provider"] == "groq"
     assert "AI analysis completed" in harness.db.activity_actions()
+    raw = stored_raw_response(harness.db)
+    assert raw["truncated"] is False
+    assert raw["chars_reviewed"] == raw["chars_total"]
+
+
+def test_blank_pdf_never_calls_the_model(harness):
+    response = upload(harness, make_pdf(None))
+
+    assert response.status_code == 200
+    review = response.json()["ai_review"]
+    assert harness.groq.calls == 0
+    assert review["completeness_label"] == "insufficient"
+    assert review["suggested_controls"] == []
+    assert "No AI analysis was performed" in review["summary"]
+    assert review["missing_sections"]
+
+    raw = stored_raw_response(harness.db)
+    assert raw["provider"] == "none"
+    assert raw["finish_reason"] == "skipped_no_text"
+    assert raw["chars_total"] == 0
+    assert "AI analysis skipped" in harness.db.activity_actions()
+    assert "AI analysis completed" not in harness.db.activity_actions()
+
+
+def test_pdf_over_20k_chars_cannot_come_back_complete(harness):
+    # 30,000+ characters of real words; the fake model says "complete".
+    text = "Access control policy requires least privilege. " * 650
+    response = upload(harness, make_pdf(text))
+
+    assert response.status_code == 200
+    review = response.json()["ai_review"]
+    assert harness.groq.calls == 1
+    assert len(harness.groq.last_prompt) < 21000
+    assert review["completeness_label"] == "partial"
+    assert any("not reviewed" in m for m in review["missing_sections"])
+
+    raw = stored_raw_response(harness.db)
+    assert raw["truncated"] is True
+    assert raw["chars_reviewed"] == 20000
+    assert raw["chars_total"] > 20000
