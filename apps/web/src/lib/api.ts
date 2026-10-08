@@ -3,6 +3,37 @@ import type { AuditorContact } from "@/lib/upload-link";
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
 
+declare global {
+  interface Window {
+    Clerk?: { loaded?: boolean; session?: { getToken: () => Promise<string | null> } | null };
+  }
+}
+
+/** The signed-in auditor's Clerk session token, or null. On the server it
+ * comes from the request's Clerk session; in the browser from the Clerk
+ * client (waiting briefly if it hasn't finished loading yet). The server
+ * branch is behind a `typeof window` check so it never reaches the browser
+ * bundle. */
+async function authToken(): Promise<string | null> {
+  if (typeof window === "undefined") {
+    const { auth } = await import("@clerk/nextjs/server");
+    const { getToken } = await auth();
+    return getToken();
+  }
+  for (let i = 0; i < 30 && !window.Clerk?.loaded; i++) await new Promise((r) => setTimeout(r, 100));
+  return (await window.Clerk?.session?.getToken()) ?? null;
+}
+
+/** fetch() for the auditor-facing API: adds `Authorization: Bearer <token>`.
+ * Without a session the call goes out unauthenticated and the API answers
+ * 401, which callers already treat like any other failed request. */
+async function apiFetch(input: string, init: RequestInit = {}): Promise<Response> {
+  const token = await authToken();
+  const headers = new Headers(init.headers);
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  return fetch(input, { ...init, headers });
+}
+
 interface WireDecision {
   id: string;
   decision: string;
@@ -99,7 +130,7 @@ interface RequestDetailWire {
 export async function fetchRequestDetail(
   requestId: string,
 ): Promise<{ request: EvidenceRequest; stakeholder: Stakeholder } | null> {
-  const response = await fetch(`${API_BASE_URL}/evidence-requests/${encodeURIComponent(requestId)}`, {
+  const response = await apiFetch(`${API_BASE_URL}/evidence-requests/${encodeURIComponent(requestId)}`, {
     cache: "no-store",
   });
   if (!response.ok) return null;
@@ -134,7 +165,7 @@ interface EvidenceReviewWire {
 }
 
 export async function fetchEvidenceReview(requestId: string): Promise<EvidenceReviewWire | null> {
-  const response = await fetch(`${API_BASE_URL}/evidence-requests/${encodeURIComponent(requestId)}/review`, {
+  const response = await apiFetch(`${API_BASE_URL}/evidence-requests/${encodeURIComponent(requestId)}/review`, {
     cache: "no-store",
   });
   // 404 means no file has been submitted yet — same "nothing to show" case
@@ -180,7 +211,7 @@ export function mapWireAiReview(wire: EvidenceReviewWire): AiReview | null {
 
 // --- GET /engagements/{id} — engagement header info for the dashboard.
 export async function fetchEngagement(engagementId: string): Promise<Engagement | null> {
-  const response = await fetch(`${API_BASE_URL}/engagements/${encodeURIComponent(engagementId)}`, {
+  const response = await apiFetch(`${API_BASE_URL}/engagements/${encodeURIComponent(engagementId)}`, {
     cache: "no-store",
   });
   if (!response.ok) return null;
@@ -205,7 +236,7 @@ export type CreateEngagementResult = { ok: true; engagement: Engagement } | { ok
 export async function createEngagement(input: CreateEngagementInput): Promise<CreateEngagementResult> {
   let response: Response;
   try {
-    response = await fetch(`${API_BASE_URL}/engagements`, {
+    response = await apiFetch(`${API_BASE_URL}/engagements`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(input),
@@ -240,7 +271,7 @@ interface ApiDashboardWire {
 export async function fetchEngagementRequests(
   engagementId: string,
 ): Promise<{ requests: EvidenceRequest[]; stakeholders: Record<string, Stakeholder> }> {
-  const response = await fetch(
+  const response = await apiFetch(
     `${API_BASE_URL}/engagements/${encodeURIComponent(engagementId)}/evidence-requests`,
     { cache: "no-store" },
   );
@@ -264,16 +295,23 @@ export type UploadEvidenceFileResult =
   | { ok: true }
   | { ok: false; received: boolean; message: string };
 
-export async function uploadEvidenceFile(requestId: string, file: File): Promise<UploadEvidenceFileResult> {
+/** Uploads one file. The stakeholder page passes the request's magic-link
+ * token (the only credential a stakeholder has); the auditor console passes
+ * none and the signed-in session token is used instead. */
+export async function uploadEvidenceFile(
+  requestId: string,
+  file: File,
+  uploadToken?: string,
+): Promise<UploadEvidenceFileResult> {
   const formData = new FormData();
   formData.append("file", file);
 
+  const url = `${API_BASE_URL}/evidence-requests/${encodeURIComponent(requestId)}/upload`;
   let response: Response;
   try {
-    response = await fetch(`${API_BASE_URL}/evidence-requests/${encodeURIComponent(requestId)}/upload`, {
-      method: "POST",
-      body: formData,
-    });
+    response = uploadToken
+      ? await fetch(url, { method: "POST", body: formData, headers: { "X-Upload-Token": uploadToken } })
+      : await apiFetch(url, { method: "POST", body: formData });
   } catch (exc) {
     return { ok: false, received: false, message: exc instanceof Error ? exc.message : "Network error" };
   }
@@ -281,6 +319,8 @@ export async function uploadEvidenceFile(requestId: string, file: File): Promise
   if (response.ok) return { ok: true };
 
   let message = `Upload failed (HTTP ${response.status})`;
+  if (response.status === 401) message = "Your session has expired. Sign in again to upload.";
+  if (response.status === 403) message = "This upload link is not valid for this request.";
   let received = false;
   try {
     const body = await response.json();
@@ -315,7 +355,7 @@ export interface ActivityEvent {
 }
 
 export async function fetchEngagementActivity(engagementId: string, limit = 20): Promise<ActivityEvent[]> {
-  const response = await fetch(
+  const response = await apiFetch(
     `${API_BASE_URL}/engagements/${encodeURIComponent(engagementId)}/activity?limit=${limit}`,
     { cache: "no-store" },
   );
@@ -324,7 +364,7 @@ export async function fetchEngagementActivity(engagementId: string, limit = 20):
 }
 
 export async function fetchRequestActivity(requestId: string): Promise<ActivityEvent[]> {
-  const response = await fetch(`${API_BASE_URL}/evidence-requests/${encodeURIComponent(requestId)}/activity`, {
+  const response = await apiFetch(`${API_BASE_URL}/evidence-requests/${encodeURIComponent(requestId)}/activity`, {
     cache: "no-store",
   });
   if (!response.ok) return [];
@@ -345,7 +385,7 @@ export interface EvidenceFileRow {
 }
 
 export async function fetchEngagementEvidenceFiles(engagementId: string): Promise<EvidenceFileRow[]> {
-  const response = await fetch(`${API_BASE_URL}/engagements/${encodeURIComponent(engagementId)}/evidence-files`, {
+  const response = await apiFetch(`${API_BASE_URL}/engagements/${encodeURIComponent(engagementId)}/evidence-files`, {
     cache: "no-store",
   });
   if (!response.ok) return [];
@@ -356,7 +396,7 @@ export async function fetchEngagementEvidenceFiles(engagementId: string): Promis
 // --- GET /evidence-files/{id}/preview-url — short-lived signed URL so the
 // browser can render the original PDF directly from Supabase Storage.
 export async function fetchFilePreviewUrl(fileId: string): Promise<string | null> {
-  const response = await fetch(`${API_BASE_URL}/evidence-files/${encodeURIComponent(fileId)}/preview-url`, {
+  const response = await apiFetch(`${API_BASE_URL}/evidence-files/${encodeURIComponent(fileId)}/preview-url`, {
     cache: "no-store",
   });
   if (!response.ok) return null;
@@ -368,7 +408,7 @@ export async function fetchFilePreviewUrl(fileId: string): Promise<string | null
 // list. Stakeholders used to be one untouched global table (fine for a
 // single seeded engagement); this is the real per-engagement list.
 export async function fetchEngagementStakeholders(engagementId: string): Promise<Stakeholder[]> {
-  const response = await fetch(`${API_BASE_URL}/engagements/${encodeURIComponent(engagementId)}/stakeholders`, {
+  const response = await apiFetch(`${API_BASE_URL}/engagements/${encodeURIComponent(engagementId)}/stakeholders`, {
     cache: "no-store",
   });
   if (!response.ok) return [];
@@ -389,7 +429,7 @@ export async function createStakeholder(
 ): Promise<CreateStakeholderResult> {
   let response: Response;
   try {
-    response = await fetch(`${API_BASE_URL}/engagements/${encodeURIComponent(engagementId)}/stakeholders`, {
+    response = await apiFetch(`${API_BASE_URL}/engagements/${encodeURIComponent(engagementId)}/stakeholders`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(input),
@@ -419,7 +459,7 @@ export async function createEvidenceRequest(
 ): Promise<CreateEvidenceRequestResult> {
   let response: Response;
   try {
-    response = await fetch(`${API_BASE_URL}/evidence-requests`, {
+    response = await apiFetch(`${API_BASE_URL}/evidence-requests`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(input),
@@ -442,7 +482,7 @@ export type SendEvidenceRequestResult = { ok: true; uploadUrl: string } | { ok: 
 export async function sendEvidenceRequest(requestId: string, toEmail: string): Promise<SendEvidenceRequestResult> {
   let response: Response;
   try {
-    response = await fetch(`${API_BASE_URL}/evidence-requests/${encodeURIComponent(requestId)}/send`, {
+    response = await apiFetch(`${API_BASE_URL}/evidence-requests/${encodeURIComponent(requestId)}/send`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ to_email: toEmail }),
@@ -459,6 +499,7 @@ export async function sendEvidenceRequest(requestId: string, toEmail: string): P
 
 async function errorMessage(response: Response, fallback: string): Promise<string> {
   let message = `${fallback} (HTTP ${response.status})`;
+  if (response.status === 401) message = "Your session has expired. Sign in again.";
   try {
     const body = await response.json();
     const detail = body?.detail;
@@ -477,7 +518,7 @@ export type ReanalyseResult = { ok: true } | { ok: false; message: string };
 export async function reanalyseEvidenceFile(fileId: string): Promise<ReanalyseResult> {
   let response: Response;
   try {
-    response = await fetch(`${API_BASE_URL}/evidence-files/${encodeURIComponent(fileId)}/analyse`, { method: "POST" });
+    response = await apiFetch(`${API_BASE_URL}/evidence-files/${encodeURIComponent(fileId)}/analyse`, { method: "POST" });
   } catch (exc) {
     return { ok: false, message: exc instanceof Error ? exc.message : "Network error" };
   }
@@ -496,7 +537,7 @@ export async function submitDecision(
 ): Promise<SubmitDecisionResult> {
   let response: Response;
   try {
-    response = await fetch(`${API_BASE_URL}/evidence-requests/${encodeURIComponent(requestId)}/decision`, {
+    response = await apiFetch(`${API_BASE_URL}/evidence-requests/${encodeURIComponent(requestId)}/decision`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(input),
@@ -518,7 +559,7 @@ export async function submitDecision(
 // there's no per-user scoping yet (single-engagement-prototype era), so this
 // is "does at least one engagement exist" rather than "this user's engagements".
 export async function fetchEngagements(): Promise<Engagement[]> {
-  const response = await fetch(`${API_BASE_URL}/engagements`, { cache: "no-store" });
+  const response = await apiFetch(`${API_BASE_URL}/engagements`, { cache: "no-store" });
   if (!response.ok) return [];
   return response.json();
 }

@@ -28,10 +28,13 @@ function nextId() {
 }
 
 export function RequestUpload({
+  token,
   request,
   stakeholder,
   auditor,
 }: {
+  /** The request's magic-link token: the stakeholder's only credential. */
+  token: string;
   request: EvidenceRequest;
   stakeholder: Stakeholder;
   auditor: AuditorContact;
@@ -40,7 +43,7 @@ export function RequestUpload({
     return <AlreadyDone request={request} auditor={auditor} />;
   }
 
-  return <UploadForm request={request} stakeholder={stakeholder} auditor={auditor} />;
+  return <UploadForm token={token} request={request} stakeholder={stakeholder} auditor={auditor} />;
 }
 
 function Header({ auditor }: { auditor: AuditorContact }) {
@@ -81,10 +84,12 @@ function AlreadyDone({ request, auditor }: { request: EvidenceRequest; auditor: 
 }
 
 function UploadForm({
+  token,
   request,
   stakeholder,
   auditor,
 }: {
+  token: string;
   request: EvidenceRequest;
   stakeholder: Stakeholder;
   auditor: AuditorContact;
@@ -129,7 +134,7 @@ function UploadForm({
     for (const f of files) {
       if (f.status === "done") continue;
       setFiles((prev) => prev.map((x) => (x.id === f.id ? { ...x, status: "uploading" } : x)));
-      const result = await uploadEvidenceFile(request.id, f.file);
+      const result = await uploadEvidenceFile(request.id, f.file, token);
       setFiles((prev) =>
         prev.map((x) =>
           x.id === f.id
