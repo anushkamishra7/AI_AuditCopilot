@@ -13,7 +13,7 @@ import resend
 from resend.emails._emails import Emails
 from resend.exceptions import ResendError
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -31,6 +31,7 @@ from groq import Groq
 dotenv_path = Path(__file__).resolve().parents[1] / ".env"
 load_dotenv(dotenv_path, override=True)
 
+from app.auth import AuthError, AuthUnavailable, bearer_token, make_jwks_signing_key_getter, verify_clerk_token
 from app.review_text import apply_coverage_check, prepare_review_text, unreadable_review, validate_model_review
 from app.upload_lookup import (
     RequestDetailResponse,
@@ -60,6 +61,12 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 SUPABASE_STORAGE_BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET")
+# Public values only (the instance's published signing keys and its issuer);
+# the Clerk secret key is deliberately not read. CLERK_AUTHORIZED_PARTIES is an
+# optional comma-separated list of web origins whose tokens are accepted.
+CLERK_JWKS_URL = os.getenv("CLERK_JWKS_URL")
+CLERK_ISSUER = os.getenv("CLERK_ISSUER")
+CLERK_AUTHORIZED_PARTIES = tuple(p.strip() for p in os.getenv("CLERK_AUTHORIZED_PARTIES", "").split(",") if p.strip())
 
 # Fail immediately and clearly if required config is missing, rather than
 # limping along and surfacing it later as an opaque 500 on whichever request
@@ -76,6 +83,8 @@ REQUIRED_ENV_VARS = {
     "SUPABASE_URL": SUPABASE_URL,
     "SUPABASE_SERVICE_ROLE_KEY": SUPABASE_SERVICE_ROLE_KEY,
     "SUPABASE_STORAGE_BUCKET": SUPABASE_STORAGE_BUCKET,
+    "CLERK_JWKS_URL": CLERK_JWKS_URL,
+    "CLERK_ISSUER": CLERK_ISSUER,
 }
 
 
@@ -137,7 +146,44 @@ async def db_request_scope():
             await run_in_threadpool(conn.close)
 
 
-app = FastAPI(title="AI Audit Copilot API", lifespan=lifespan, dependencies=[Depends(db_request_scope)])
+_signing_key = make_jwks_signing_key_getter(CLERK_JWKS_URL)
+
+# Routes that do not need an auditor token. Every other route does -- a route
+# added later is protected by default. The upload route is listed because it
+# authorises itself (auditor token OR the request's own magic-link token, see
+# _authorize_upload); the lookup is keyed by that magic-link token.
+PUBLIC_ROUTES = {
+    ("GET", "/health"),
+    ("GET", "/upload/{token}"),
+    ("POST", "/evidence-requests/{request_id}/upload"),
+}
+
+
+def verify_request_token(token: str) -> dict:
+    try:
+        return verify_clerk_token(
+            token,
+            signing_key_getter=_signing_key,
+            issuer=CLERK_ISSUER,
+            authorized_parties=CLERK_AUTHORIZED_PARTIES,
+        )
+    except AuthError as exc:
+        raise HTTPException(status_code=401, detail=str(exc), headers={"WWW-Authenticate": "Bearer"})
+    except AuthUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+
+def require_auditor(request: Request) -> None:
+    route = request.scope.get("route")
+    if (request.method, getattr(route, "path", None)) in PUBLIC_ROUTES:
+        return
+    token = bearer_token(request.headers.get("authorization"))
+    if token is None:
+        raise HTTPException(status_code=401, detail="Authentication required", headers={"WWW-Authenticate": "Bearer"})
+    request.state.auditor = verify_request_token(token)
+
+
+app = FastAPI(title="AI Audit Copilot API", lifespan=lifespan, dependencies=[Depends(require_auditor), Depends(db_request_scope)])
 
 app.add_middleware(
     CORSMiddleware,
@@ -858,6 +904,31 @@ def request_groq_review(doc_text: str) -> tuple[dict, dict | None]:
 
 
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
+
+
+def _authorize_upload(db, request: Request, request_id: str) -> None:
+    """An upload is allowed for a signed-in auditor, or for whoever holds the
+    request's own magic-link token (sent as X-Upload-Token). A bearer token, if
+    present, is judged on its own: an invalid one is 401 even if an upload
+    token is also supplied. An unknown request is 403 to a token holder (it
+    must not reveal which request ids exist) and 404 to an auditor."""
+    bearer = bearer_token(request.headers.get("authorization"))
+    supplied = request.headers.get("x-upload-token")
+    if bearer is None and not supplied:
+        raise HTTPException(status_code=401, detail="Authentication required", headers={"WWW-Authenticate": "Bearer"})
+    if bearer is not None:
+        request.state.auditor = verify_request_token(bearer)
+
+    with db.cursor() as cur:
+        cur.execute("SELECT token FROM evidence_requests WHERE id = %s", (request_id,))
+        row = cur.fetchone()
+    if bearer is not None:
+        if row is None:
+            raise HTTPException(status_code=404, detail="Evidence request not found")
+        return
+    stored = row[0] if row else None
+    if not stored or not secrets.compare_digest(stored.encode(), supplied.encode()):
+        raise HTTPException(status_code=403, detail="This upload link is not valid for this request")
 logger = logging.getLogger("audit_copilot")
 
 
@@ -936,7 +1007,7 @@ def analyse_and_store(db, request_id: str, file_id: str, full_text: str, prepare
 
 
 @app.post("/evidence-requests/{request_id}/upload")
-def upload_evidence_file(request_id: str, file: UploadFile = File(...)):
+def upload_evidence_file(request_id: str, request: Request, file: UploadFile = File(...)):
     # Everything that can be rejected is rejected BEFORE the first side
     # effect (storage, database), so a bad upload leaves nothing behind and a
     # retry can't create a duplicate.
@@ -944,10 +1015,7 @@ def upload_evidence_file(request_id: str, file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Only PDF uploads are supported")
 
     db = get_db_connection()
-    with db.cursor() as cur:
-        cur.execute("SELECT 1 FROM evidence_requests WHERE id = %s", (request_id,))
-        if cur.fetchone() is None:
-            raise HTTPException(status_code=404, detail="Evidence request not found")
+    _authorize_upload(db, request, request_id)
 
     contents = file.file.read(MAX_UPLOAD_BYTES + 1)
     if len(contents) > MAX_UPLOAD_BYTES:

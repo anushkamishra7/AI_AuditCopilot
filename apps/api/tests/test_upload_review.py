@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from pypdf import PdfWriter
 
 import app.main as main
+from tests.auth_helpers import bearer, install, make_token
 
 
 def make_pdf(text: str | None) -> bytes:
@@ -58,8 +59,8 @@ class FakeCursor:
 
     def fetchone(self):
         sql = self.db.statements[-1][0] if self.db.statements else ""
-        if sql.startswith("SELECT 1 FROM evidence_requests") and not self.db.request_exists:
-            return None
+        if sql.startswith("SELECT token FROM evidence_requests"):
+            return (self.db.request_token,) if self.db.request_exists else None
         if sql.startswith("SELECT evidence_request_id, path FROM evidence_files"):
             return ("req_1", "file_stored.pdf") if self.db.file_exists else None
         if sql.startswith("SELECT 1 FROM ai_reviews"):
@@ -72,6 +73,7 @@ class FakeDb:
         self.statements = []
         self.commits = 0
         self.request_exists = True
+        self.request_token = "tok_valid"
         self.file_exists = True
         self.has_review = False
 
@@ -143,9 +145,18 @@ def harness(monkeypatch):
     monkeypatch.setattr(main, "groq_client", groq)
     storage = FakeStorage()
     monkeypatch.setattr(main, "supabase_client", SimpleNamespace(storage=storage))
+    install(monkeypatch, main)
     # No `with`: TestClient then skips the lifespan, which would open a real
     # Postgres connection.
-    return SimpleNamespace(client=TestClient(main.app), db=db, groq=groq, storage=storage)
+    # A signed-in auditor by default; harness.anon is the same app with no
+    # credentials.
+    return SimpleNamespace(
+        client=TestClient(main.app, headers=bearer(make_token())),
+        anon=TestClient(main.app),
+        db=db,
+        groq=groq,
+        storage=storage,
+    )
 
 
 def upload(harness, pdf: bytes):

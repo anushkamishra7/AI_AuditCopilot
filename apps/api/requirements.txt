@@ -30,3 +30,7 @@ sqlalchemy==2.0.4
 requests==2.34.2
 httpx==0.28.0
 pytest==8.4.0
+
+# Verifies Clerk session JWTs on the auditor-facing endpoints (RS256 against
+# the instance's public JWKS; see app/auth.py). [crypto] brings `cryptography`.
+PyJWT[crypto]==2.15.1

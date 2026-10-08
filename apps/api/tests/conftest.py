@@ -17,5 +17,7 @@ for _name, _value in {
     "SUPABASE_URL": "https://placeholder.supabase.co",
     "SUPABASE_SERVICE_ROLE_KEY": "test-service-role-key",
     "SUPABASE_STORAGE_BUCKET": "test-bucket",
+    "CLERK_JWKS_URL": "https://clerk.test.example/.well-known/jwks.json",
+    "CLERK_ISSUER": "https://clerk.test.example",
 }.items():
     os.environ.setdefault(_name, _value)

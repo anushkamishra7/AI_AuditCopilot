@@ -82,8 +82,11 @@ RESEND_API_KEY=...
 SUPABASE_URL=https://<project-ref>.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=...          # service_role secret, not anon
 SUPABASE_STORAGE_BUCKET=...            # a private bucket you've created
+CLERK_JWKS_URL=https://<frontend-api>/.well-known/jwks.json   # public
+CLERK_ISSUER=https://<frontend-api>                           # public
 
 # optional, have defaults:
+CLERK_AUTHORIZED_PARTIES=http://localhost:3000   # comma-separated web origins; unset = not checked
 RESEND_FROM=onboarding@resend.dev
 UPLOAD_BASE_URL=http://localhost:3000/upload
 ```
@@ -100,6 +103,22 @@ Run it:
 ```bash
 uvicorn app.main:app --reload --port 8000
 ```
+
+## Authentication
+
+Every endpoint except three requires `Authorization: Bearer <Clerk session
+JWT>`; the token is verified (RS256, issuer, expiry) against the Clerk
+instance's public JWKS. Only the public JWKS URL and issuer are configured --
+the Clerk secret key is not used by the API.
+`<frontend-api>` is your Clerk instance's Frontend API domain (it is encoded in
+the publishable key, and shown in the Clerk dashboard under API keys).
+
+Public: `GET /health`, `GET /upload/{token}` (stakeholder lookup, keyed by the
+magic-link token), and `POST /evidence-requests/{id}/upload`, which accepts
+either an auditor token or the request's own magic-link token in an
+`X-Upload-Token` header. A wrong link token is 403; no credentials is 401.
+Not yet done: per-engagement authorization (any signed-in auditor can read any
+engagement).
 
 ## Known constraints
 
