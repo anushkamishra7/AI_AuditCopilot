@@ -511,6 +511,80 @@ async function errorMessage(response: Response, fallback: string): Promise<strin
   return message;
 }
 
+// --- GET /engagements/{id}/report — everything the printable report shows.
+// Mirrors apps/api/app/report.py. Anything under `review` was written by the
+// model (`ai_generated` is always true there); the rest is recorded fact.
+export type ReportCoverageStatus = "fully_reviewed" | "partly_reviewed" | "not_reviewed" | "coverage_not_recorded";
+
+export interface ReportFile {
+  id: string;
+  filename: string;
+  size_bytes: number | null;
+  uploaded_at: string | null;
+  coverage: { status: ReportCoverageStatus; detail: string };
+  review: {
+    ai_generated: true;
+    document_type: string | null;
+    summary: string | null;
+    completeness_label: CompletenessLabel | null;
+    suggested_controls: { control_name: string; confidence_label: string; rationale: string }[];
+    missing_sections: string[];
+    provider: string | null;
+    model: string | null;
+    reviewed_at: string | null;
+  } | null;
+}
+
+export interface ReportCoverageItem {
+  request_id: string;
+  request_title: string;
+  control_ref: string;
+  file_id: string;
+  filename: string;
+  detail: string;
+}
+
+export interface EngagementReport {
+  generated_at: string;
+  engagement: {
+    id: string;
+    name: string;
+    client_name: string;
+    frameworks: string[];
+    period_start: string | null;
+    period_end: string | null;
+    lead_auditor: string | null;
+  };
+  coverage: {
+    files_total: number;
+    fully_reviewed: number;
+    partly_reviewed: ReportCoverageItem[];
+    not_reviewed: ReportCoverageItem[];
+    coverage_not_recorded: ReportCoverageItem[];
+    requests_without_files: { request_id: string; request_title: string; control_ref: string; status: string }[];
+  };
+  requests: {
+    id: string;
+    control_ref: string;
+    title: string;
+    description: string | null;
+    status: string;
+    due_date: string | null;
+    stakeholder: { full_name: string; role_title: string | null } | null;
+    files: ReportFile[];
+    decision: { decision: DecisionType; note: string | null; decided_by: string; decided_at: string | null } | null;
+    activity: { actor: string; actor_type: string; action: string; detail: string | null; created_at: string | null }[];
+  }[];
+}
+
+export async function fetchEngagementReport(engagementId: string): Promise<EngagementReport | null> {
+  const response = await apiFetch(`${API_BASE_URL}/engagements/${encodeURIComponent(engagementId)}/report`, {
+    cache: "no-store",
+  });
+  if (!response.ok) return null;
+  return response.json();
+}
+
 // --- POST /evidence-files/{id}/analyse — re-runs the AI review for a stored
 // file that has none (the model was down, or returned something unusable).
 export type ReanalyseResult = { ok: true } | { ok: false; message: string };

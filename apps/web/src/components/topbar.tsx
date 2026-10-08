@@ -34,7 +34,7 @@ export function Topbar({
   }
 
   return (
-    <header className="sticky top-0 z-10 flex h-16 items-center gap-4 border-b border-[var(--border)] bg-[var(--surface)]/95 px-4 backdrop-blur sm:px-7">
+    <header className="sticky top-0 z-10 flex h-16 items-center gap-4 border-b border-[var(--border)] bg-[var(--surface)]/95 px-4 backdrop-blur sm:px-7 print:hidden">
       {/* Only rendered visually below `lg` -- see MobileNav; AppShell's
           desktop <aside> already covers `lg` and up, this stands in for it
           below that, it doesn't duplicate it. */}

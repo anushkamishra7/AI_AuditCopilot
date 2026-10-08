@@ -190,3 +190,16 @@ body {
     scroll-behavior: auto !important;
   }
 }
+
+
+/* Printing (the engagement report): plain white page, sensible margins. The
+   app shell hides itself with print:hidden. */
+@page {
+  margin: 16mm;
+}
+
+@media print {
+  body {
+    background: #ffffff;
+  }
+}

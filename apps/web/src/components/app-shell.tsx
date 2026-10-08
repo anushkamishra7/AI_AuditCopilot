@@ -22,6 +22,7 @@ function navFor(engagementId: string, needsReviewCount: number): { primary: NavI
       { label: "Findings", href: `${base}/findings` },
     ],
     secondary: [
+      { label: "Report", href: `${base}/report` },
       { label: "Activity", href: `${base}/activity` },
       { label: "Settings", href: `${base}/settings` },
     ],
@@ -52,7 +53,7 @@ export function AppShell({
 
   return (
     <div className="flex min-h-screen bg-[var(--bg)]">
-      <aside className="hidden w-60 shrink-0 flex-col border-r border-[var(--border)] bg-[var(--surface)] lg:flex">
+      <aside className="hidden w-60 shrink-0 flex-col border-r border-[var(--border)] bg-[var(--surface)] lg:flex print:hidden">
         <div className="flex h-14 items-center border-b border-[var(--border)] px-4">
           <Link href={`/engagements/${engagementId}`} className="flex items-center">
             <LogoMotion className="text-[22px] leading-none" />
