@@ -4,7 +4,9 @@ import { useLayoutEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 
-export type NavItem = { label: string; href: string };
+// `badge` is a count shown beside the label when greater than zero (e.g.
+// requests waiting on the auditor's review).
+export type NavItem = { label: string; href: string; badge?: number };
 
 function isActiveItem(item: NavItem, pathname: string) {
   // Overview's own href has no trailing segment, so it must match exactly --
@@ -93,13 +95,21 @@ function NavGroup({
                 // indicator is the absolutely-positioned bar above now, not
                 // a border on the link itself, so text no longer needs to
                 // shift when the border used to appear/disappear.
-                className={`block rounded-md py-1.5 pr-2.5 pl-3 text-sm font-medium transition-colors duration-150 ${
+                className={`flex items-center justify-between gap-2 rounded-md py-1.5 pr-2.5 pl-3 text-sm font-medium transition-colors duration-150 ${
                   active
                     ? "bg-[var(--surface-raised)] text-[var(--accent)]"
                     : "text-[var(--ink-secondary)] hover:bg-[var(--surface-raised)] hover:text-[var(--ink)]"
                 }`}
               >
-                {item.label}
+                <span>{item.label}</span>
+                {item.badge ? (
+                  <span
+                    aria-label={`${item.badge} need${item.badge === 1 ? "s" : ""} review`}
+                    className="min-w-5 rounded-full bg-[var(--status-amber-bg)] px-1.5 text-center text-[11px] leading-5 font-semibold text-[var(--status-amber-ink)] ring-1 ring-[var(--status-amber-ring)]"
+                  >
+                    {item.badge}
+                  </span>
+                ) : null}
               </Link>
             </li>
           );

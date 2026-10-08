@@ -5,7 +5,7 @@ import { EngagementSwitcher } from "@/components/engagement-switcher";
 import { LogoMotion } from "@/components/logo-motion";
 import { PageTransition } from "@/components/page-transition";
 
-function navFor(engagementId: string): { primary: NavItem[]; secondary: NavItem[] } {
+function navFor(engagementId: string, needsReviewCount: number): { primary: NavItem[]; secondary: NavItem[] } {
   const base = `/engagements/${engagementId}`;
   return {
     // Every item here is a real page backed by real data. Workpapers,
@@ -15,8 +15,9 @@ function navFor(engagementId: string): { primary: NavItem[]; secondary: NavItem[
     // is worse than no page at all.
     primary: [
       { label: "Overview", href: base },
+      { label: "Upload", href: `${base}/upload` },
       { label: "Evidence", href: `${base}/evidence` },
-      { label: "Requests", href: `${base}/requests` },
+      { label: "Requests", href: `${base}/requests`, badge: needsReviewCount },
       { label: "Controls", href: `${base}/controls` },
       { label: "Findings", href: `${base}/findings` },
     ],
@@ -34,6 +35,7 @@ export function AppShell({
   userName,
   userInitials,
   userEmail,
+  needsReviewCount = 0,
   children,
 }: {
   engagementId: string;
@@ -42,9 +44,11 @@ export function AppShell({
   userName: string;
   userInitials: string;
   userEmail: string | null;
+  /** Requests with an upload waiting on the auditor; shown as a badge on Requests. */
+  needsReviewCount?: number;
   children: React.ReactNode;
 }) {
-  const nav = navFor(engagementId);
+  const nav = navFor(engagementId, needsReviewCount);
 
   return (
     <div className="flex min-h-screen bg-[var(--bg)]">

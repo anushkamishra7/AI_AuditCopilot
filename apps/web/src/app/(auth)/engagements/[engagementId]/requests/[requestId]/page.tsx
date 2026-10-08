@@ -3,6 +3,7 @@ import { notFound } from "next/navigation";
 import { currentUser } from "@clerk/nextjs/server";
 import { StatusBadge } from "@/components/badges";
 import { ControlChip } from "@/components/control-chip";
+import { AnalysisSummary } from "@/components/review/analysis-summary";
 import { ReviewPanel } from "@/components/review/review-panel";
 import { dueLabel } from "@/lib/format";
 import { fetchEvidenceReview, fetchRequestDetail, fetchRequestActivity, mapWireAiReview } from "@/lib/api";
@@ -26,6 +27,7 @@ export default async function ReviewPage(
   props: PageProps<"/engagements/[engagementId]/requests/[requestId]">,
 ) {
   const { engagementId, requestId } = await props.params;
+  const { from } = await props.searchParams;
 
   // Real backend requests take priority; fall back to the mock-data
   // prototype set for IDs the API doesn't know about (e.g. req_014) so the
@@ -104,6 +106,7 @@ export default async function ReviewPage(
       </header>
 
       <main className="bg-[var(--bg)]">
+        <AnalysisSummary request={request} justUploaded={from === "upload"} />
         <p className="border-b border-[var(--border)] bg-[var(--surface)] px-7 py-2 text-sm text-[var(--ink-muted)]">
           <span className="font-medium text-[var(--ink-secondary)]">Request sent to stakeholder:</span>{" "}
           {request.description}

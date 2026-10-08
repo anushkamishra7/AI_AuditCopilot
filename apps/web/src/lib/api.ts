@@ -287,13 +287,13 @@ export async function uploadEvidenceFile(requestId: string, file: File): Promise
     const detail = body?.detail;
     const detailMessage = typeof detail === "string" ? detail : detail?.message;
     if (detailMessage) message = detailMessage;
-    // main.py writes the file to Supabase Storage and inserts the
-    // evidence_files row BEFORE extracting PDF text or calling the review
-    // model (Groq, was Gemini) — so if either of those two specific steps
-    // is what failed, the evidence itself was still received, it just
-    // doesn't have an AI review yet. Any other failure (bad content type,
-    // Supabase Storage itself failing) means nothing was saved.
-    received = detailMessage === "Failed to extract PDF text" || detailMessage === "Groq API request failed";
+    // main.py rejects bad uploads (not a PDF, too large, unreadable) before
+    // storing anything, and saves the file and advances the request before it
+    // calls the review model -- so the only failure where the evidence was
+    // still received is the model call itself ("Groq API request failed").
+    // The file is saved and the auditor can still see it; only the AI review
+    // is missing.
+    received = detailMessage === "Groq API request failed";
   } catch {
     // non-JSON error body — keep the generic HTTP-status message
   }
@@ -468,6 +468,21 @@ async function errorMessage(response: Response, fallback: string): Promise<strin
     // non-JSON error body — keep the generic message
   }
   return message;
+}
+
+// --- POST /evidence-files/{id}/analyse — re-runs the AI review for a stored
+// file that has none (the model was down, or returned something unusable).
+export type ReanalyseResult = { ok: true } | { ok: false; message: string };
+
+export async function reanalyseEvidenceFile(fileId: string): Promise<ReanalyseResult> {
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE_URL}/evidence-files/${encodeURIComponent(fileId)}/analyse`, { method: "POST" });
+  } catch (exc) {
+    return { ok: false, message: exc instanceof Error ? exc.message : "Network error" };
+  }
+  if (response.ok) return { ok: true };
+  return { ok: false, message: await errorMessage(response, "Could not run the analysis") };
 }
 
 // --- POST /evidence-requests/{id}/decision — real persistence for the
