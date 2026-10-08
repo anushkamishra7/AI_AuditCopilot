@@ -6,6 +6,7 @@ from app.review_text import (
     apply_coverage_check,
     prepare_review_text,
     unreadable_review,
+    validate_model_review,
 )
 
 WORDS = "Access control policy requires least privilege. "
@@ -110,3 +111,70 @@ def test_coverage_note_not_duplicated():
 def test_coverage_tolerates_bad_missing_sections():
     out = apply_coverage_check({"completeness_label": "complete", "missing_sections": "oops"}, truncated())
     assert len(out["missing_sections"]) == 1
+
+
+GOOD = {
+    "document_type": "access control policy",
+    "summary": "Defines access.",
+    "suggested_controls": [{"control_name": "AC-1", "confidence_label": "strong_match", "rationale": "x"}],
+    "missing_sections": ["Review cadence"],
+    "completeness_label": "partial",
+}
+
+
+def test_validate_passes_a_good_review_through():
+    assert validate_model_review(GOOD) == GOOD
+
+
+@pytest.mark.parametrize("raw", [None, [], "text", 7, [GOOD]])
+def test_validate_rejects_anything_that_is_not_an_object(raw):
+    assert validate_model_review(raw) is None
+
+
+@pytest.mark.parametrize("label", ["COMPLETE", "done", "", None, 3, ["complete"]])
+def test_validate_unknown_completeness_becomes_insufficient_with_a_note(label):
+    out = validate_model_review({**GOOD, "completeness_label": label})
+    assert out["completeness_label"] == "insufficient"
+    assert any("unrecognised completeness rating" in m for m in out["missing_sections"])
+
+
+def test_validate_missing_completeness_is_not_complete():
+    raw = {k: v for k, v in GOOD.items() if k != "completeness_label"}
+    assert validate_model_review(raw)["completeness_label"] == "insufficient"
+
+
+def test_validate_fixes_bad_confidence_and_drops_nameless_controls():
+    raw = {
+        **GOOD,
+        "suggested_controls": [
+            {"control_name": "AC-1", "confidence_label": "certain", "rationale": 5},
+            {"control_name": "", "confidence_label": "strong_match"},
+            {"confidence_label": "strong_match"},
+            "not-a-dict",
+        ],
+    }
+    out = validate_model_review(raw)
+    assert out["suggested_controls"] == [{"control_name": "AC-1", "confidence_label": "weak_match", "rationale": ""}]
+
+
+def test_validate_coerces_wrong_types_instead_of_crashing():
+    out = validate_model_review(
+        {"document_type": 5, "summary": None, "suggested_controls": "AC-1", "missing_sections": "none", "completeness_label": "partial"}
+    )
+    assert out == {
+        "document_type": "Unclassified document",
+        "summary": "",
+        "suggested_controls": [],
+        "missing_sections": [],
+        "completeness_label": "partial",
+    }
+
+
+def test_validate_drops_non_string_and_blank_missing_sections():
+    out = validate_model_review({**GOOD, "missing_sections": ["ok", "", "  ", 3, None]})
+    assert out["missing_sections"] == ["ok"]
+
+
+def test_validate_unhashable_confidence_label_does_not_crash():
+    raw = {**GOOD, "suggested_controls": [{"control_name": "AC-1", "confidence_label": ["strong_match"]}]}
+    assert validate_model_review(raw)["suggested_controls"][0]["confidence_label"] == "weak_match"

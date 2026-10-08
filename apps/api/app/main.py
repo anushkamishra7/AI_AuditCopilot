@@ -4,6 +4,7 @@ import secrets
 import ssl
 import sys
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +13,8 @@ import resend
 from resend.emails._emails import Emails
 from resend.exceptions import ResendError
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from fastapi import UploadFile, File
@@ -20,6 +22,7 @@ from supabase import create_client
 from storage3.exceptions import StorageApiError
 import uuid
 import json
+import logging
 import re
 from datetime import datetime
 from pypdf import PdfReader
@@ -28,7 +31,7 @@ from groq import Groq
 dotenv_path = Path(__file__).resolve().parents[1] / ".env"
 load_dotenv(dotenv_path, override=True)
 
-from app.review_text import apply_coverage_check, prepare_review_text, unreadable_review
+from app.review_text import apply_coverage_check, prepare_review_text, unreadable_review, validate_model_review
 from app.upload_lookup import (
     RequestDetailResponse,
     UploadLookupResponse,
@@ -101,13 +104,40 @@ supabase_client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.db = psycopg.connect(DATABASE_URL)
+    # Fail fast if the database is unreachable, rather than on the first request.
+    with psycopg.connect(DATABASE_URL):
+        pass
     yield
-    if hasattr(app.state, "db"):
-        app.state.db.close()
 
 
-app = FastAPI(title="AI Audit Copilot API", lifespan=lifespan)
+# One database connection per request, closed when the request ends.
+#
+# This used to be a single connection shared by every request. Two failures
+# came from that: one failed statement left it in "current transaction is
+# aborted" so every later request returned 500 until a restart, and
+# concurrent requests interleaved their transactions. A per-thread connection
+# fixed the first but not the second: read-only handlers never end their
+# transaction, so each worker thread's connection sat "idle in transaction"
+# holding table locks, and the handlers' lazy `ALTER TABLE ... IF NOT EXISTS`
+# migrations (which need an exclusive lock even when they change nothing)
+# queued behind them and hung every request. Closing the connection at the
+# end of the request releases everything, committed or not.
+_request_db: ContextVar[dict | None] = ContextVar("request_db", default=None)
+
+
+async def db_request_scope():
+    holder: dict = {"conn": None}
+    token = _request_db.set(holder)
+    try:
+        yield
+    finally:
+        _request_db.reset(token)
+        conn = holder["conn"]
+        if conn is not None and not conn.closed:
+            await run_in_threadpool(conn.close)
+
+
+app = FastAPI(title="AI Audit Copilot API", lifespan=lifespan, dependencies=[Depends(db_request_scope)])
 
 app.add_middleware(
     CORSMiddleware,
@@ -118,9 +148,15 @@ app.add_middleware(
 
 
 def get_db_connection():
-    if not hasattr(app.state, "db"):
-        app.state.db = psycopg.connect(DATABASE_URL)
-    return app.state.db
+    """The current request's connection (opened on first use). Callers don't
+    close it; db_request_scope does when the request ends."""
+    holder = _request_db.get()
+    if holder is None:  # outside a request: the caller owns the connection
+        return psycopg.connect(DATABASE_URL)
+    conn = holder["conn"]
+    if conn is None or conn.closed or conn.broken:
+        conn = holder["conn"] = psycopg.connect(DATABASE_URL)
+    return conn
 
 
 class SendEvidenceRequestPayload(BaseModel):
@@ -752,7 +788,13 @@ def extract_pdf_text(contents: bytes) -> str:
             text_parts.append(page_text)
         return "\n".join(text_parts)
     except Exception as exc:
-        raise HTTPException(status_code=500, detail={"message": "Failed to extract PDF text", "error": str(exc)})
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "This PDF couldn't be read. It may be corrupt or password-protected.",
+                "error": str(exc),
+            },
+        )
 
 
 def request_groq_review(doc_text: str) -> tuple[dict, dict | None]:
@@ -815,16 +857,115 @@ def request_groq_review(doc_text: str) -> tuple[dict, dict | None]:
     return body, parsed
 
 
+MAX_UPLOAD_BYTES = 15 * 1024 * 1024
+logger = logging.getLogger("audit_copilot")
+
+
+def _record_analysis_failure(db, request_id: str, detail: str, action: str = "AI analysis failed") -> None:
+    with db.cursor() as cur:
+        log_activity(cur, request_id, "AI review", "ai", action, detail)
+        db.commit()
+
+
+def analyse_and_store(db, request_id: str, file_id: str, full_text: str, prepared) -> dict | None:
+    """Runs the review for one stored file and records the outcome. Shared by
+    the upload and by re-analysis. Returns the review dict, or None when the
+    model answered with something that is not a usable review (nothing is
+    stored then, so the UI shows "no analysis" instead of a made-up verdict).
+    Raises 502, after logging it, when the model call itself fails."""
+    if prepared.has_text:
+        try:
+            body, parsed = request_groq_review(prepared.doc_text)
+        except HTTPException as exc:
+            # The file is saved and visible to the auditor; only the analysis
+            # is missing. Say so in the activity log and in the response.
+            detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
+            _record_analysis_failure(db, request_id, str(detail.get("error") or detail.get("message")))
+            raise HTTPException(status_code=exc.status_code, detail={**detail, "evidence_file_id": file_id})
+        # Validate the model's JSON against the review schema before it is
+        # stored or shown; None means it wasn't a JSON object at all.
+        parsed = validate_model_review(parsed) if parsed is not None else None
+        if parsed is None:
+            logger.warning("Model returned no usable review for %s: %.500s", file_id, body.get("text"))
+            _record_analysis_failure(db, request_id, "Model response was not a valid review object", action="AI analysis incomplete")
+            return None
+    else:
+        # Scanned / image-only PDF: nothing to send. Don't ask the model to
+        # review an empty document -- it returns a normal-looking review.
+        body = {
+            "provider": "none",
+            "model_requested": None,
+            "model_resolved": None,
+            "text": None,
+            "finish_reason": "skipped_no_text",
+        }
+        parsed = unreadable_review(prepared)
+
+    # Code-based floors on completeness_label — run regardless of what the
+    # model concluded. See apply_placeholder_check / apply_coverage_check.
+    parsed = apply_placeholder_check(parsed, full_text)
+    parsed = apply_coverage_check(parsed, prepared)
+    body["chars_total"] = prepared.chars_total
+    body["chars_reviewed"] = prepared.chars_reviewed
+    body["truncated"] = prepared.truncated
+
+    with db.cursor() as cur:
+        cur.execute(
+            "INSERT INTO ai_reviews (id, evidence_file_id, document_type, summary, suggested_controls, missing_sections, completeness_label, raw_response) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+            (
+                f"ai_{uuid.uuid4().hex}",
+                file_id,
+                parsed["document_type"],
+                parsed["summary"],
+                json.dumps(parsed["suggested_controls"]),
+                json.dumps(parsed["missing_sections"]),
+                parsed["completeness_label"],
+                json.dumps(body),
+            ),
+        )
+        if not prepared.has_text:
+            log_activity(cur, request_id, "AI review", "ai", "AI analysis skipped", "No extractable text in PDF; the model was not called")
+        else:
+            flags = len(parsed["missing_sections"])
+            detail = f"Classified as {parsed['document_type']} — completeness: {parsed['completeness_label']}"
+            if flags:
+                detail += f", {flags} item{'s' if flags != 1 else ''} flagged"
+            log_activity(cur, request_id, "AI review", "ai", "AI analysis completed", detail)
+        db.commit()
+    return parsed
+
+
 @app.post("/evidence-requests/{request_id}/upload")
 def upload_evidence_file(request_id: str, file: UploadFile = File(...)):
-    # only accept PDFs for this first-pass implementation
+    # Everything that can be rejected is rejected BEFORE the first side
+    # effect (storage, database), so a bad upload leaves nothing behind and a
+    # retry can't create a duplicate.
     if file.content_type != "application/pdf":
         raise HTTPException(status_code=400, detail="Only PDF uploads are supported")
 
+    db = get_db_connection()
+    with db.cursor() as cur:
+        cur.execute("SELECT 1 FROM evidence_requests WHERE id = %s", (request_id,))
+        if cur.fetchone() is None:
+            raise HTTPException(status_code=404, detail="Evidence request not found")
+
+    contents = file.file.read(MAX_UPLOAD_BYTES + 1)
+    if len(contents) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail=f"File is larger than {MAX_UPLOAD_BYTES // (1024 * 1024)} MB")
+    if not contents:
+        raise HTTPException(status_code=400, detail="The file is empty")
+    # The content type is whatever the client claimed; check the bytes.
+    if b"%PDF-" not in contents[:1024]:
+        raise HTTPException(status_code=400, detail="This file doesn't look like a PDF")
+    size_bytes = len(contents)
+
+    # Extract text from the in-memory bytes first: a corrupt or encrypted PDF
+    # is rejected (422) with nothing stored.
+    full_text = extract_pdf_text(contents)
+    prepared = prepare_review_text(full_text)
+
     file_id = f"file_{uuid.uuid4().hex}"
     storage_key = f"{file_id}.pdf"
-    contents = file.file.read()
-    size_bytes = len(contents)
 
     # Uploaded to Supabase Storage, not local disk -- local disk doesn't
     # survive a redeploy and isn't shared across instances/hosts. Nothing is
@@ -841,7 +982,6 @@ def upload_evidence_file(request_id: str, file: UploadFile = File(...)):
             detail={"message": "Supabase Storage upload failed", "error": str(exc)},
         )
 
-    db = get_db_connection()
     # ensure tables exist (simple DDL for local testing)
     with db.cursor() as cur:
         cur.execute(
@@ -899,79 +1039,49 @@ def upload_evidence_file(request_id: str, file: UploadFile = File(...)):
             "Evidence uploaded",
             f"{storage_key} ({size_bytes:,} bytes)",
         )
-        db.commit()
-
-    # extract text from the PDF -- straight from the in-memory bytes just
-    # uploaded, no round trip back to disk or to Supabase needed.
-    full_text = extract_pdf_text(contents)
-
-    prepared = prepare_review_text(full_text)
-
-    if prepared.has_text:
-        body, parsed = request_groq_review(prepared.doc_text)
-    else:
-        # Scanned / image-only PDF: nothing to send. Don't ask the model to
-        # review an empty document -- it returns a normal-looking review.
-        body = {
-            "provider": "none",
-            "model_requested": None,
-            "model_resolved": None,
-            "text": None,
-            "finish_reason": "skipped_no_text",
-        }
-        parsed = unreadable_review(prepared)
-
-    # Code-based floors on completeness_label — run regardless of what the
-    # model concluded. See apply_placeholder_check / apply_coverage_check.
-    if parsed is not None:
-        parsed = apply_placeholder_check(parsed, full_text)
-        parsed = apply_coverage_check(parsed, prepared)
-    body["chars_total"] = prepared.chars_total
-    body["chars_reviewed"] = prepared.chars_reviewed
-    body["truncated"] = prepared.truncated
-
-    # persist ai_review row
-    ai_id = f"ai_{uuid.uuid4().hex}"
-    with db.cursor() as cur:
-        cur.execute(
-            "INSERT INTO ai_reviews (id, evidence_file_id, document_type, summary, suggested_controls, missing_sections, completeness_label, raw_response) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
-            (
-                ai_id,
-                file_id,
-                parsed.get("document_type") if parsed else None,
-                parsed.get("summary") if parsed else None,
-                json.dumps(parsed.get("suggested_controls")) if parsed and parsed.get("suggested_controls") is not None else None,
-                json.dumps(parsed.get("missing_sections")) if parsed and parsed.get("missing_sections") is not None else None,
-                parsed.get("completeness_label") if parsed else None,
-                json.dumps(body) if body is not None else None,
-            ),
-        )
-        # The request's own status column was otherwise never touched by this
-        # endpoint — it would sit at whatever seed.py/send_magic_link left it
-        # at (e.g. "awaiting_upload") forever, even once a file was uploaded
-        # and analyzed. This is what the review panel's top badge reads, so
-        # it needs to actually reflect that a review now exists and is
-        # waiting on the auditor, not still on the stakeholder.
+        # The request's status moves with the file, in the same commit. It
+        # used to move only after the model call, so a model failure left a
+        # stored file on a request still reading "awaiting_upload" -- and the
+        # retry then stored a second copy.
         cur.execute(
             "UPDATE evidence_requests SET status = %s, last_activity_at = NOW() WHERE id = %s",
             ("pending_review", request_id),
         )
-        if not prepared.has_text:
-            log_activity(cur, request_id, "AI review", "ai", "AI analysis skipped", "No extractable text in PDF; the model was not called")
-        elif parsed:
-            flags = len(parsed.get("missing_sections") or [])
-            detail = f"Classified as {parsed.get('document_type', 'unknown document')} — completeness: {parsed.get('completeness_label', 'unknown')}"
-            if flags:
-                detail += f", {flags} item{'s' if flags != 1 else ''} flagged"
-            log_activity(cur, request_id, "AI review", "ai", "AI analysis completed", detail)
-        else:
-            log_activity(cur, request_id, "AI review", "ai", "AI analysis incomplete", "Model response could not be parsed as JSON")
         db.commit()
+
+    parsed = analyse_and_store(db, request_id, file_id, full_text, prepared)
 
     return {
         "evidence_file": {"id": file_id, "filename": storage_key, "path": storage_key, "size_bytes": size_bytes},
-        "ai_review": parsed if parsed else {"raw_response": body},
+        "ai_review": parsed if parsed else {"raw_response": None},
     }
+
+
+@app.post("/evidence-files/{file_id}/analyse")
+def reanalyse_evidence_file(file_id: str):
+    """Re-runs the AI review for a stored file that has none (the model was
+    down, or returned something unusable). Refuses if a review already exists,
+    so a double click can't create two."""
+    db = get_db_connection()
+    with db.cursor() as cur:
+        cur.execute("SELECT evidence_request_id, path FROM evidence_files WHERE id = %s", (file_id,))
+        row = cur.fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Evidence file not found")
+        request_id, storage_key = row
+        cur.execute("SELECT 1 FROM ai_reviews WHERE evidence_file_id = %s", (file_id,))
+        if cur.fetchone() is not None:
+            raise HTTPException(status_code=409, detail="This file already has an AI review")
+
+    try:
+        contents = supabase_client.storage.from_(SUPABASE_STORAGE_BUCKET).download(storage_key)
+    except StorageApiError as exc:
+        raise HTTPException(status_code=502, detail={"message": "Could not read the stored file", "error": str(exc)})
+
+    full_text = extract_pdf_text(contents)
+    prepared = prepare_review_text(full_text)
+    parsed = analyse_and_store(db, request_id, file_id, full_text, prepared)
+    return {"ai_review": parsed}
 
 
 @app.get("/evidence-requests/{request_id}/review")

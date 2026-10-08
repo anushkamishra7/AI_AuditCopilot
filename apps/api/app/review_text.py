@@ -11,6 +11,7 @@ MAX_REVIEW_CHARS = 20000
 MIN_ALPHA_CHARS = 50
 
 COMPLETENESS_RANK = {"insufficient": 0, "partial": 1, "complete": 2}
+CONFIDENCE_LABELS = ("strong_match", "partial_match", "weak_match")
 
 
 @dataclass(frozen=True)
@@ -75,3 +76,55 @@ def apply_coverage_check(parsed: dict, prepared: PreparedText) -> dict:
         missing.append(note)
     parsed["missing_sections"] = missing
     return parsed
+
+
+def validate_model_review(raw) -> dict | None:
+    """Coerces the model's JSON into the review schema, or returns None if it
+    isn't a JSON object at all. A model can return a label outside the allowed
+    set, a string where a list belongs, or a control with no name; none of that
+    may reach the database or the auditor as if it were valid. An unrecognised
+    completeness rating is treated as "insufficient" (the conservative reading)
+    and says so in missing_sections."""
+    if not isinstance(raw, dict):
+        return None
+
+    document_type = raw.get("document_type")
+    document_type = document_type.strip() if isinstance(document_type, str) else ""
+    summary = raw.get("summary")
+    summary = summary.strip() if isinstance(summary, str) else ""
+
+    controls = []
+    for item in raw.get("suggested_controls") if isinstance(raw.get("suggested_controls"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("control_name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        confidence = item.get("confidence_label")
+        rationale = item.get("rationale")
+        controls.append(
+            {
+                "control_name": name.strip(),
+                "confidence_label": confidence if isinstance(confidence, str) and confidence in CONFIDENCE_LABELS else "weak_match",
+                "rationale": rationale.strip() if isinstance(rationale, str) else "",
+            }
+        )
+
+    missing = [
+        m.strip()
+        for m in (raw.get("missing_sections") if isinstance(raw.get("missing_sections"), list) else [])
+        if isinstance(m, str) and m.strip()
+    ]
+
+    label = raw.get("completeness_label")
+    if not isinstance(label, str) or label not in COMPLETENESS_RANK:
+        label = "insufficient"
+        missing.append("The model returned an unrecognised completeness rating, so this document is treated as insufficient.")
+
+    return {
+        "document_type": document_type or "Unclassified document",
+        "summary": summary,
+        "suggested_controls": controls,
+        "missing_sections": missing,
+        "completeness_label": label,
+    }
