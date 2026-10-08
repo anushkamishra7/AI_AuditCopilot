@@ -19,6 +19,12 @@ uploads/                 # LEGACY — pre-Supabase-migration local test files.
 
 - `GET /health` — healthcheck
 - `GET /engagements/{engagement_id}` — engagement lookup
+- `GET /engagements/{engagement_id}/report` — everything the printable
+  report shows: requests, files, AI reviews (labelled `ai_generated`), the
+  auditor's decision, the activity trail, and a coverage summary of files that
+  were not reviewed or only partly reviewed
+- `POST /evidence-files/{file_id}/analyse` — re-run the AI review for a stored
+  file that has none (409 if it already has one)
 - `GET /engagements/{engagement_id}/evidence-requests` — every real evidence
   request for the engagement, each with its files and latest AI review
   inlined, plus the distinct stakeholders touched. Powers the evidence

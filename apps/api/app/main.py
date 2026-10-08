@@ -32,6 +32,7 @@ dotenv_path = Path(__file__).resolve().parents[1] / ".env"
 load_dotenv(dotenv_path, override=True)
 
 from app.auth import AuthError, AuthUnavailable, bearer_token, make_jwks_signing_key_getter, verify_clerk_token
+from app.report import build_report
 from app.review_text import apply_coverage_check, prepare_review_text, unreadable_review, validate_model_review
 from app.upload_lookup import (
     RequestDetailResponse,
@@ -654,6 +655,135 @@ def get_engagement(engagement_id: str) -> EngagementResponse:
         )
 
 
+def _iso(value):
+    return value.isoformat() if value is not None else None
+
+
+@app.get("/engagements/{engagement_id}/report")
+def get_engagement_report(engagement_id: str):
+    """Everything the printable report shows, in one response: the engagement,
+    each request with its files, the AI review of each file (labelled as
+    AI-generated), the auditor's decision and the activity trail, plus a
+    coverage summary of what was not reviewed or only partly reviewed."""
+    db = get_db_connection()
+    with db.cursor() as cur:
+        ensure_engagement_schema(cur)
+        ensure_evidence_schema(cur)
+        ensure_review_decisions_schema(cur)
+        db.commit()
+
+        cur.execute(
+            "SELECT id, name, client_name, period_start, period_end, lead_auditor FROM engagements WHERE id = %s",
+            (engagement_id,),
+        )
+        e = cur.fetchone()
+        if e is None:
+            raise HTTPException(status_code=404, detail="Engagement not found")
+        cur.execute("SELECT framework FROM engagement_frameworks WHERE engagement_id = %s ORDER BY framework", (engagement_id,))
+        engagement = {
+            "id": e[0],
+            "name": e[1],
+            "client_name": e[2],
+            "frameworks": [r[0] for r in cur.fetchall()],
+            "period_start": _iso(e[3]),
+            "period_end": _iso(e[4]),
+            "lead_auditor": e[5],
+        }
+
+        cur.execute(
+            """
+            SELECT r.id, r.control_ref, r.title, r.description, r.status, r.due_date, s.full_name, s.role_title
+            FROM evidence_requests r LEFT JOIN stakeholders s ON s.id = r.stakeholder_id
+            WHERE r.engagement_id = %s ORDER BY r.due_date, r.control_ref, r.id
+            """,
+            (engagement_id,),
+        )
+        requests = [
+            {
+                "id": r[0],
+                "control_ref": r[1],
+                "title": r[2],
+                "description": r[3],
+                "status": r[4],
+                "due_date": _iso(r[5]),
+                "stakeholder": {"full_name": r[6], "role_title": r[7]} if r[6] else None,
+            }
+            for r in cur.fetchall()
+        ]
+        request_ids = [r["id"] for r in requests]
+
+        cur.execute(
+            """
+            SELECT f.id, f.evidence_request_id, f.filename, f.size_bytes, f.uploaded_at
+            FROM evidence_files f JOIN evidence_requests r ON r.id = f.evidence_request_id
+            WHERE r.engagement_id = %s
+            """,
+            (engagement_id,),
+        )
+        files = [
+            {"id": f[0], "evidence_request_id": f[1], "filename": f[2], "size_bytes": f[3], "uploaded_at": _iso(f[4])}
+            for f in cur.fetchall()
+        ]
+
+        # newest review per file
+        cur.execute(
+            """
+            SELECT DISTINCT ON (a.evidence_file_id)
+                a.evidence_file_id, a.document_type, a.summary, a.suggested_controls,
+                a.missing_sections, a.completeness_label, a.raw_response, a.created_at
+            FROM ai_reviews a
+            JOIN evidence_files f ON f.id = a.evidence_file_id
+            JOIN evidence_requests r ON r.id = f.evidence_request_id
+            WHERE r.engagement_id = %s
+            ORDER BY a.evidence_file_id, a.created_at DESC
+            """,
+            (engagement_id,),
+        )
+        reviews_by_file = {
+            a[0]: {
+                "document_type": a[1],
+                "summary": a[2],
+                "suggested_controls": a[3],
+                "missing_sections": a[4],
+                "completeness_label": a[5],
+                "raw_response": a[6],
+                "created_at": _iso(a[7]),
+            }
+            for a in cur.fetchall()
+        }
+
+        cur.execute(
+            """
+            SELECT DISTINCT ON (request_id) request_id, decision, note, decided_by, decided_at
+            FROM review_decisions WHERE request_id = ANY(%s)
+            ORDER BY request_id, decided_at DESC
+            """,
+            (request_ids,),
+        )
+        decisions_by_request = {
+            d[0]: {"decision": d[1], "note": d[2], "decided_by": d[3], "decided_at": _iso(d[4])} for d in cur.fetchall()
+        }
+
+        cur.execute(
+            "SELECT request_id, actor, actor_type, action, detail, created_at FROM activity_log WHERE request_id = ANY(%s) ORDER BY created_at",
+            (request_ids,),
+        )
+        activity = [
+            {"request_id": a[0], "actor": a[1], "actor_type": a[2], "action": a[3], "detail": a[4], "created_at": _iso(a[5])}
+            for a in cur.fetchall()
+        ]
+
+    return build_report(
+        engagement=engagement,
+        requests=requests,
+        files=files,
+        reviews_by_file=reviews_by_file,
+        decisions_by_request=decisions_by_request,
+        activity=activity,
+        generated_at=datetime.now().astimezone().isoformat(),
+    )
+
+
 @app.get("/engagements/{engagement_id}/evidence-requests")
 def get_engagement_requests(engagement_id: str):
     return list_requests_for_engagement(engagement_id)
@@ -903,6 +1033,42 @@ def request_groq_review(doc_text: str) -> tuple[dict, dict | None]:
     return body, parsed
 
 
+def ensure_evidence_schema(cur) -> None:
+    """evidence_files / ai_reviews are created lazily (there are no
+    migrations), so anything that reads them must make sure they exist."""
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS evidence_files (
+            id TEXT PRIMARY KEY,
+            evidence_request_id TEXT,
+            filename TEXT,
+            path TEXT,
+            size_bytes BIGINT,
+            uploaded_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """
+    )
+    # Lazy migration for a table created before size_bytes existed, and
+    # before `path` was repurposed to hold a Supabase Storage object key
+    # instead of a local filesystem path.
+    cur.execute("ALTER TABLE evidence_files ADD COLUMN IF NOT EXISTS size_bytes BIGINT")
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ai_reviews (
+            id TEXT PRIMARY KEY,
+            evidence_file_id TEXT REFERENCES evidence_files(id),
+            document_type TEXT,
+            summary TEXT,
+            suggested_controls JSONB,
+            missing_sections JSONB,
+            completeness_label TEXT,
+            raw_response JSONB,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """
+    )
+
+
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
 
 
@@ -1050,39 +1216,8 @@ def upload_evidence_file(request_id: str, request: Request, file: UploadFile = F
             detail={"message": "Supabase Storage upload failed", "error": str(exc)},
         )
 
-    # ensure tables exist (simple DDL for local testing)
     with db.cursor() as cur:
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS evidence_files (
-                id TEXT PRIMARY KEY,
-                evidence_request_id TEXT,
-                filename TEXT,
-                path TEXT,
-                size_bytes BIGINT,
-                uploaded_at TIMESTAMPTZ DEFAULT NOW()
-            )
-            """
-        )
-        # Lazy migration for a table created before size_bytes existed, and
-        # before `path` was repurposed to hold a Supabase Storage object key
-        # instead of a local filesystem path.
-        cur.execute("ALTER TABLE evidence_files ADD COLUMN IF NOT EXISTS size_bytes BIGINT")
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS ai_reviews (
-                id TEXT PRIMARY KEY,
-                evidence_file_id TEXT REFERENCES evidence_files(id),
-                document_type TEXT,
-                summary TEXT,
-                suggested_controls JSONB,
-                missing_sections JSONB,
-                completeness_label TEXT,
-                raw_response JSONB,
-                created_at TIMESTAMPTZ DEFAULT NOW()
-            )
-            """
-        )
+        ensure_evidence_schema(cur)
 
         cur.execute(
             "INSERT INTO evidence_files (id, evidence_request_id, filename, path, size_bytes) VALUES (%s, %s, %s, %s, %s)",
