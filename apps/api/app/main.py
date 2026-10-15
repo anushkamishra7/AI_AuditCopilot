@@ -889,7 +889,9 @@ def get_request_detail_route(request_id: str):
 # Name]". Deliberately code-based, not AI judgment — the model will happily
 # call a document "complete" even with visible placeholder brackets still in
 # it, so this acts as a hard floor underneath whatever it concludes.
-PLACEHOLDER_PATTERN = re.compile(r"\[[^\[\]\n]{1,50}\]")
+# (?!\() skips Markdown link text, "[handbook](https://...)". 80 chars is room
+# for a long field name without sweeping up bracketed prose.
+PLACEHOLDER_PATTERN = re.compile(r"\[[^\[\]\n]{1,80}\](?!\()")
 
 COMPLETENESS_RANK = {"insufficient": 0, "partial": 1, "complete": 2}
 

@@ -14,8 +14,9 @@ Each case holds the document text (or `text_repeat` for long ones), the model
 output to simulate, and the expected placeholders, final label and notes.
 
 Reported: precision/recall of placeholder detection, pass rate per case, and
-`known_gap` cases (real limitations, listed but not gating). Today's two:
-placeholders over 50 characters are missed, and `[link text]` in Markdown
-links is flagged as a placeholder.
+`known_gap` cases (real limitations, listed but not gating; none today). The
+first run of this set found two: placeholders over 50 characters were missed,
+and `[link text]` in Markdown links was flagged. Both are fixed in
+`PLACEHOLDER_PATTERN` (cap raised to 80, links skipped) and the cases now gate.
 
 Add a case whenever a document produces a wrong review.

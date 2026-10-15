@@ -16,10 +16,10 @@ def test_guardrail_eval_set_passes():
     assert report["placeholder_precision"] == 1.0 and report["placeholder_recall"] == 1.0
 
 
-def test_known_gaps_still_reproduce():
-    """If one of these starts passing, the gap was fixed: move the case out of known_gap."""
+def test_known_gap_cases_are_still_failing_if_any():
+    """A known_gap case must still fail; once fixed, remove its tag so it gates."""
     report = run_evals.score_offline(run_evals.load_cases())
-    assert report["known_gaps"] and all(not r["passed"] for r in report["known_gaps"])
+    assert all(not r["passed"] for r in report["known_gaps"])
 
 
 def test_harness_catches_a_broken_guardrail(monkeypatch):
